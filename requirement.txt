@@ -1,4 +1,5 @@
-growwapi==1.5.0
+growwapi
 pandas
 numpy
 pyotp
+requests
