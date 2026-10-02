@@ -1,4 +1,8 @@
 growwapi
+smartapi-python
+logzero
+websocket-client
+pycryptodome
 pandas
 numpy
 pyotp
