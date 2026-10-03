@@ -1308,11 +1308,11 @@ def _place_market_order(
 # Groww's API does not support MARKET orders for this product, so we widen
 # the LIMIT price step by step to chase a fill without crossing the full
 # spread blindly on the first attempt.
-ESCALATION_OFFSETS = (2, 5, 10)
+ESCALATION_OFFSETS = (2, 5, 10, 15)
 FILL_WAIT_RETRIES  = 6     # polls per offset attempt
 FILL_WAIT_INTERVAL = 1.0   # seconds between polls
 
-# 4th-retry fallback (EXIT ONLY): if all 3 LIMIT offsets above fail to fill,
+# Fallback (EXIT ONLY): if all LIMIT offsets above fail to fill,
 # cancel the resting order and fire one MARKET order instead of leaving the
 # exit unconfirmed. Entries (sell_option) intentionally do NOT use this —
 # only exits (buy_to_cover_option) do, since getting OUT of a short matters
@@ -1330,7 +1330,10 @@ def _get_filled_quantity(detail: dict) -> float:
     we'd rather under-detect a partial fill than crash on an unexpected
     response schema.
     """
-    for key in ("filled_quantity", "quantity_filled", "executed_quantity", "filled_qty"):
+    for key in (
+        "filled_quantity", "quantity_filled", "executed_quantity",
+        "filled_qty", "cumulative_quantity", "traded_quantity", "cum_quantity",
+    ):
         val = detail.get(key)
         if val is not None:
             try:
@@ -1347,7 +1350,7 @@ def _market_fallback(
     quantity: int,
     label: str,
     resting_order_id: str,
-) -> tuple[str, float | None]:
+) -> tuple[str, float | None, int]:
     """
     The 4th retry, used only when _execute_with_escalation is called with
     use_market_fallback=True (i.e. exits) and all 3 LIMIT offsets failed to
@@ -1363,10 +1366,8 @@ def _market_fallback(
     correctly refuses with "Cancellation not allowed", which the old code
     misread as "state uncertain" and aborted on).
 
-    Always returns a (order_id, fill_price_or_None) tuple — same contract as
-    _execute_with_escalation — so callers don't need special-casing. A
-    fill_price of None means "treat as PENDING/UNCONFIRMED, verify on Groww",
-    exactly as with the existing LIMIT-only behavior.
+    Always returns a (order_id, fill_price_or_None, executed_qty) tuple —
+    same contract as _execute_with_escalation.
     """
     FILLED_STATUSES = ("EXECUTED", "COMPLETED", "DELIVERY_AWAITED")
 
@@ -1378,21 +1379,26 @@ def _market_fallback(
                 "non_trading", groww.get_order_detail,
                 groww_order_id=resting_order_id, segment=groww.SEGMENT_FNO,
             )
-            if detail.get("order_status") in FILLED_STATUSES:
-                fill_price = float(detail.get("average_fill_price") or 0)
+            filled_qty = int(round(_get_filled_quantity(detail)))
+            fill_price = float(detail.get("average_fill_price") or 0)
+            status = detail.get("order_status")
+
+            if filled_qty >= quantity or (status in FILLED_STATUSES and filled_qty == 0):
                 if fill_price:
                     log.info(
-                        f"{label}: resting order {resting_order_id} filled right "
+                        f"{label}: resting order {resting_order_id} fully filled right "
                         "before the MARKET fallback — using this fill instead."
                     )
-                    return resting_order_id, fill_price
-            if _get_filled_quantity(detail) > 0:
+                    return resting_order_id, fill_price, quantity
+
+            if filled_qty > 0:
                 log.warning(
                     f"{label}: resting order {resting_order_id} shows a PARTIAL "
-                    "fill right before the MARKET fallback. NOT cancelling or "
-                    "placing a MARKET order on top of it. VERIFY ACTUAL POSITION ON GROWW."
+                    f"fill ({filled_qty}/{quantity}) right before MARKET fallback. "
+                    "NOT cancelling or placing a MARKET order on top of it. "
+                    "VERIFY ACTUAL POSITION ON GROWW."
                 )
-                return resting_order_id, None
+                return resting_order_id, fill_price or None, filled_qty
         except Exception as e:
             log.warning(f"{label}: pre-cancel check failed for {resting_order_id}: {e}")
 
@@ -1411,7 +1417,7 @@ def _market_fallback(
                 "whose state is uncertain. Treating as PENDING/UNCONFIRMED. "
                 "VERIFY ACTUAL POSITION ON GROWW."
             )
-            return resting_order_id, None
+            return resting_order_id, None, 0
     else:
         log.info(f"{label}: no resting order to check/cancel — going straight to MARKET.")
 
@@ -1427,7 +1433,7 @@ def _market_fallback(
                 f"Response: {resp}. Original LIMIT order {resting_order_id} was "
                 "already cancelled. VERIFY ACTUAL POSITION ON GROWW."
             )
-            return resting_order_id, None
+            return resting_order_id, None, 0
     except Exception as e:
         log.error(
             f"{label}: MARKET fallback order placement failed: {e}. Original "
@@ -1436,7 +1442,7 @@ def _market_fallback(
             "POSITION ON GROWW.",
             exc_info=True,
         )
-        return resting_order_id, None
+        return resting_order_id, None, 0
 
     # Poll the MARKET order for a fill.
     for _ in range(MARKET_FALLBACK_POLL_RETRIES):
@@ -1446,39 +1452,62 @@ def _market_fallback(
                 groww_order_id=market_order_id, segment=groww.SEGMENT_FNO,
             )
             status = detail.get("order_status")
-            if status in FILLED_STATUSES:
-                fill_price = float(detail.get("average_fill_price") or 0)
+            filled_qty = int(round(_get_filled_quantity(detail)))
+            fill_price = float(detail.get("average_fill_price") or 0)
+
+            if filled_qty >= quantity or (status in FILLED_STATUSES and filled_qty == 0):
                 if fill_price:
                     log.info(
                         f"{label}: MARKET fallback order {market_order_id} filled "
-                        f"avg_fill_price=₹{fill_price:.2f}  status={status}"
+                        f"qty={quantity}  avg_fill_price=₹{fill_price:.2f}  status={status}"
                     )
-                    return market_order_id, fill_price
+                    return market_order_id, fill_price, quantity
+
             if status in ("REJECTED", "FAILED", "CANCELLED"):
+                if filled_qty > 0:
+                    log.warning(
+                        f"{label}: MARKET fallback order {market_order_id} ended status={status} "
+                        f"with PARTIAL fill ({filled_qty}/{quantity}) @ ₹{fill_price:.2f}."
+                    )
+                    return market_order_id, fill_price or None, filled_qty
                 log.warning(
                     f"{label}: MARKET fallback order {market_order_id} ended "
                     f"status={status} without a confirmed fill. Original LIMIT "
                     "order was already cancelled. VERIFY ACTUAL POSITION ON GROWW."
                 )
-                return market_order_id, None
-            filled_qty = _get_filled_quantity(detail)
-            if filled_qty > 0:
-                log.warning(
+                return market_order_id, None, 0
+
+            if 0 < filled_qty < quantity:
+                log.info(
                     f"{label}: MARKET fallback order {market_order_id} shows a "
-                    f"PARTIAL fill ({filled_qty}/{quantity}). Returning as "
-                    "PENDING/UNCONFIRMED. VERIFY ACTUAL POSITION ON GROWW."
+                    f"partial fill ({filled_qty}/{quantity}) — waiting for remainder to execute..."
                 )
-                return market_order_id, None
         except Exception as e:
             log.warning(f"{label}: error polling MARKET fallback order {market_order_id}: {e}")
         time.sleep(MARKET_FALLBACK_POLL_INTERVAL)
+
+    try:
+        final_detail = _call(
+            "non_trading", groww.get_order_detail,
+            groww_order_id=market_order_id, segment=groww.SEGMENT_FNO,
+        )
+        final_qty = int(round(_get_filled_quantity(final_detail)))
+        final_price = float(final_detail.get("average_fill_price") or 0)
+        if final_qty > 0:
+            log.warning(
+                f"{label}: MARKET fallback order {market_order_id} finished polling with "
+                f"partial fill ({final_qty}/{quantity}) @ ₹{final_price:.2f}."
+            )
+            return market_order_id, final_price or None, final_qty
+    except Exception:
+        pass
 
     log.warning(
         f"{label}: MARKET fallback order {market_order_id} still not confirmed "
         f"filled after {MARKET_FALLBACK_POLL_RETRIES} polls. Treating as "
         "PENDING/UNCONFIRMED. Manual check on Groww recommended."
     )
-    return market_order_id, None
+    return market_order_id, None, 0
 
 
 def _execute_with_escalation(
@@ -1489,68 +1518,35 @@ def _execute_with_escalation(
     side: str,          # "SELL" or "BUY"
     label: str,
     use_market_fallback: bool = False,
-) -> tuple[str, float | None]:
+) -> tuple[str, float | None, int]:
     """
     Place a LIMIT order, escalating the price offset from LTP across
-    ESCALATION_OFFSETS until it fills or all offsets are exhausted.
+    ESCALATION_OFFSETS until the entire target quantity fills or all offsets are exhausted.
+
+    If an order partially fills (e.g. 30 of 60), the unfilled resting portion is cancelled,
+    and a NEW order is immediately placed for the remaining quantity (e.g. 30) at the
+    next escalation offset instead of continuing to trade with only partial quantity.
 
     For SELL: price = LTP - offset (sell into the bid, more aggressive with larger offset)
     For BUY:  price = LTP + offset (buy through the ask, more aggressive with larger offset)
 
-    On each attempt:
-      - place the LIMIT order
-      - poll get_order_detail up to FILL_WAIT_RETRIES times
-      - if filled (EXECUTED/COMPLETED/DELIVERY_AWAITED with average_fill_price), return (order_id, fill_price)
-      - else cancel the resting order and retry with the next, wider offset
-
-    If the final (widest) offset also doesn't fill:
-      - if use_market_fallback is True and EXIT_MARKET_FALLBACK_ENABLED (a 4th
-        retry, intended for EXITS only): cancel the resting LIMIT order and
-        place ONE MARKET order, polling MARKET_FALLBACK_POLL_RETRIES times.
-        If that fills, return (order_id, fill_price). If it doesn't fill, is
-        rejected, or errors (e.g. MARKET orders unsupported for this
-        product), fall back to the same "leave resting / unconfirmed"
-        behaviour described below.
-      - otherwise (or if the market fallback itself didn't resolve things),
-        the order is LEFT RESTING (not cancelled) and (order_id, None) is
-        returned — caller must treat the position as "order pending, fill
-        unconfirmed" rather than assuming it's flat.
-
-    Safety behavior:
-      - If ANY exception occurs AFTER an order has already been placed
-        (i.e. we have an order_id from this call), we stop immediately and
-        return that order as (order_id, None) — PENDING/UNCONFIRMED —
-        instead of letting the exception propagate. Callers rely on getting
-        a tuple back to record the position; if we let the exception
-        escape here, the caller loses all record of an order that may
-        already be live on the exchange, and the next signal could place a
-        second, duplicate order on top of it. If NO order has been placed
-        yet, the exception is safe to re-raise (nothing to lose track of).
-      - If polling shows a PARTIAL fill (some quantity executed but the
-        order isn't in a terminal filled/rejected/cancelled status), we
-        halt escalation entirely rather than cancelling and placing a new
-        order at a wider offset. Cancelling a partially filled order only
-        cancels the REMAINING quantity — escalating on top of it would
-        risk ending up with two separate positions instead of one.
-      - After a successful cancel, we re-check the order once more before
-        moving to the next offset, to catch the race where the exchange
-        fills the order right at (or just before) the cancel takes effect.
+    Returns (order_id, weighted_fill_price_or_None, total_executed_quantity).
     """
     FILLED_STATUSES = ("EXECUTED", "COMPLETED", "DELIVERY_AWAITED")
     DEAD_STATUSES   = ("REJECTED", "FAILED", "CANCELLED")
+
+    target_quantity = quantity
+    remaining_qty   = quantity
+    fills: list[tuple[int, float, str]] = []  # [(qty, fill_price, order_id), ...]
     last_order_id = ""
-    # Tracks an order id that, as far as we know, might STILL be live/resting
-    # on the exchange. Distinct from last_order_id (which is purely
-    # informational/for logging): this one is cleared to "" the moment we
-    # positively confirm an order is no longer live — a REJECTED/FAILED/
-    # CANCELLED status, or a cancel_order call that itself succeeds. Only
-    # THIS is what the safety-net paths below (the outer exception handler,
-    # and the final fallback) should treat as "possibly still live, must
-    # stay conservative" — everything else is a case we've actually resolved.
     last_live_order_id = ""
 
     for i, offset in enumerate(ESCALATION_OFFSETS):
+        if remaining_qty <= 0:
+            break
+
         is_last_offset = (i == len(ESCALATION_OFFSETS) - 1)
+        order_qty = remaining_qty
         try:
             ltp = get_option_ltp(groww, trading_symbol)
             if side == "SELL":
@@ -1559,8 +1555,8 @@ def _execute_with_escalation(
                 price = round(ltp + offset, 2)
 
             resp = _place_limit_order(
-                groww, trading_symbol, transaction_type, quantity, price,
-                f"{label} (offset=₹{offset})"
+                groww, trading_symbol, transaction_type, order_qty, price,
+                f"{label} (offset=₹{offset}, attempt={i + 1}/{len(ESCALATION_OFFSETS)}, qty={order_qty}/{target_quantity})"
             )
             order_id = resp.get("groww_order_id", "")
             last_order_id = order_id or last_order_id
@@ -1570,141 +1566,220 @@ def _execute_with_escalation(
                 log.warning(f"{label}: place_order returned no groww_order_id. Response: {resp}")
                 continue
 
-            partial_fill_seen  = False
-            order_confirmed_dead = False  # REJECTED/FAILED/CANCELLED — nothing to cancel, no fill
+            partial_fill_seen    = False
+            partial_fill_qty     = 0
+            order_confirmed_dead = False
+
             for _ in range(FILL_WAIT_RETRIES):
                 try:
                     detail = _call(
                         "non_trading", groww.get_order_detail,
                         groww_order_id=order_id, segment=groww.SEGMENT_FNO,
                     )
-                    status = detail.get("order_status")
-                    if status in FILLED_STATUSES:
-                        fill_price = float(detail.get("average_fill_price") or 0)
-                        if fill_price:
-                            log.info(
-                                f"{label}: filled at offset=₹{offset}  "
-                                f"avg_fill_price=₹{fill_price:.2f}  status={status}"
-                            )
-                            return order_id, fill_price
-                    if status in DEAD_STATUSES:
-                        # BUG FIX (found 27-Aug-2026): this order is
-                        # definitively dead — Groww will refuse a
-                        # cancel_order call on it ("Cancellation not
-                        # allowed"). The OLD code fell through to the
-                        # unconditional cancel attempt below regardless,
-                        # which then failed and was misread as "state
-                        # uncertain, halt escalation, unconfirmed" — even
-                        # though the status here is completely certain
-                        # (dead, not live), and even on offset #1 of 3,
-                        # abandoning the ₹5/₹10 retries entirely. Mark it
-                        # dead here instead so we skip the pointless cancel
-                        # and correctly move on / report "no position".
-                        log.warning(f"{label}: order {order_id} ended status={status} before fill.")
-                        order_confirmed_dead = True
-                        last_live_order_id = ""  # confirmed not live
-                        break
-                    filled_qty = _get_filled_quantity(detail)
-                    if filled_qty > 0:
-                        partial_fill_seen = True
-                        log.warning(
-                            f"{label}: order {order_id} shows a PARTIAL fill "
-                            f"({filled_qty}/{quantity}) at offset=₹{offset}, status={status}. "
-                            "Halting escalation — will NOT cancel/re-place at a new offset, to "
-                            "avoid ending up with a second position on top of this partial one. "
-                            "VERIFY ACTUAL POSITION ON GROWW."
+                    status     = detail.get("order_status")
+                    filled_qty = int(round(_get_filled_quantity(detail)))
+                    fill_price = float(detail.get("average_fill_price") or 0)
+
+                    # 1. Full fill of this order chunk
+                    if filled_qty >= order_qty or (status in FILLED_STATUSES and filled_qty == 0):
+                        actual_price = fill_price or price
+                        fills.append((order_qty, actual_price, order_id))
+                        remaining_qty -= order_qty
+                        last_live_order_id = ""
+                        log.info(
+                            f"{label}: order {order_id} filled {order_qty} @ ₹{actual_price:.2f} "
+                            f"(offset=₹{offset}). Total filled: {target_quantity - remaining_qty}/{target_quantity}"
                         )
                         break
+
+                    # 2. Terminal dead status
+                    if status in DEAD_STATUSES:
+                        if filled_qty > 0:
+                            actual_price = fill_price or price
+                            fills.append((filled_qty, actual_price, order_id))
+                            remaining_qty -= filled_qty
+                            log.warning(
+                                f"{label}: order {order_id} ended status={status} with partial fill "
+                                f"({filled_qty}/{order_qty}) @ ₹{actual_price:.2f}. "
+                                f"Remaining quantity to fill: {remaining_qty}"
+                            )
+                        else:
+                            log.warning(f"{label}: order {order_id} ended status={status} before fill.")
+                        order_confirmed_dead = True
+                        last_live_order_id = ""
+                        break
+
+                    # 3. Terminal executed status on broker with partial quantity
+                    if status in FILLED_STATUSES and 0 < filled_qty < order_qty:
+                        actual_price = fill_price or price
+                        fills.append((filled_qty, actual_price, order_id))
+                        remaining_qty -= filled_qty
+                        order_confirmed_dead = True
+                        last_live_order_id = ""
+                        log.warning(
+                            f"{label}: order {order_id} marked {status} with partial fill "
+                            f"({filled_qty}/{order_qty}) @ ₹{actual_price:.2f}. "
+                            f"Remaining quantity to fill: {remaining_qty}"
+                        )
+                        break
+
+                    # 4. Partial fill in-flight (order still open/active)
+                    if 0 < filled_qty < order_qty:
+                        partial_fill_seen = True
+                        partial_fill_qty  = filled_qty
+                        log.info(
+                            f"{label}: order {order_id} has partial fill ({filled_qty}/{order_qty}), "
+                            "waiting for remaining quantity to execute..."
+                        )
+
                 except Exception as e:
                     log.warning(f"Error polling order {order_id}: {e}")
                 time.sleep(FILL_WAIT_INTERVAL)
 
-            if partial_fill_seen:
-                return order_id, None
+            # If remaining_qty is now 0 (fully filled during polling), done!
+            if remaining_qty <= 0:
+                break
+
+            # If partial fill was seen during polling and order is still resting:
+            # Cancel the remaining unfilled portion and immediately escalate for remaining_qty
+            if partial_fill_seen and not order_confirmed_dead:
+                try:
+                    _call(
+                        "orders", groww.cancel_order,
+                        groww_order_id=order_id, segment=groww.SEGMENT_FNO,
+                    )
+                    log.info(
+                        f"{label}: cancelled remaining unfilled portion of partially filled order {order_id}."
+                    )
+                except Exception as e:
+                    log.warning(f"{label}: failed to cancel remaining unfilled portion of {order_id}: {e}")
+
+                try:
+                    final_detail = _call(
+                        "non_trading", groww.get_order_detail,
+                        groww_order_id=order_id, segment=groww.SEGMENT_FNO,
+                    )
+                    final_qty = int(round(_get_filled_quantity(final_detail))) or partial_fill_qty
+                    final_price = float(final_detail.get("average_fill_price") or 0) or price
+                except Exception:
+                    final_qty = partial_fill_qty
+                    final_price = price
+
+                fills.append((final_qty, final_price, order_id))
+                remaining_qty -= final_qty
+                last_live_order_id = ""
+
+                log.warning(
+                    f"{label}: order {order_id} partially filled ({final_qty}/{order_qty}) @ ₹{final_price:.2f}. "
+                    f"Remaining quantity needed: {remaining_qty}. Immediately placing new order at next offset..."
+                )
+
+                if remaining_qty <= 0:
+                    break
+                continue
 
             if order_confirmed_dead:
+                if remaining_qty <= 0:
+                    break
                 if is_last_offset:
                     if use_market_fallback and EXIT_MARKET_FALLBACK_ENABLED:
                         log.warning(
-                            f"{label}: order {order_id} was {status} at the widest "
-                            f"offset (₹{offset}) — nothing live to cancel. Going "
-                            "straight to a MARKET order (4th retry)."
+                            f"{label}: order {order_id} was dead at widest offset (₹{offset}). "
+                            f"Going straight to MARKET fallback for remaining {remaining_qty}."
                         )
-                        # resting_order_id="" tells _market_fallback there is
-                        # nothing to check/cancel first — the LIMIT order is
-                        # already confirmed dead.
-                        return _market_fallback(
-                            groww, trading_symbol, transaction_type, quantity, label, ""
+                        m_id, m_price, m_qty = _market_fallback(
+                            groww, trading_symbol, transaction_type, remaining_qty, label, ""
                         )
+                        if m_qty > 0:
+                            fills.append((m_qty, m_price or price, m_id))
+                            remaining_qty -= m_qty
+                        break
                     log.warning(
-                        f"{label}: order {order_id} was {status} at the widest offset "
-                        f"(₹{offset}) — every attempt failed. No order is live and no "
-                        "position was created for this signal."
+                        f"{label}: order {order_id} was dead at widest offset (₹{offset}). "
+                        f"Escalation exhausted. Total filled: {target_quantity - remaining_qty}/{target_quantity}."
                     )
-                    return "", None  # definitively no position — NOT "unconfirmed"
+                    break
                 log.info(
-                    f"{label}: order {order_id} was {status} at offset=₹{offset} — "
-                    "nothing to cancel, moving straight to the next offset."
+                    f"{label}: order {order_id} dead at offset=₹{offset} — moving to next offset for remaining {remaining_qty}."
                 )
                 continue
 
+            # If not filled and not dead at last offset:
             if is_last_offset:
                 if use_market_fallback and EXIT_MARKET_FALLBACK_ENABLED:
                     log.warning(
-                        f"{label}: order {order_id} not filled even at widest offset "
-                        f"(₹{offset}). Attempting 4th retry — cancel and place a MARKET order."
+                        f"{label}: order {order_id} not filled even at widest offset (₹{offset}). "
+                        f"Attempting fallback — cancel and place MARKET order for remaining {remaining_qty}."
                     )
-                    return _market_fallback(
-                        groww, trading_symbol, transaction_type, quantity, label, order_id
+                    m_id, m_price, m_qty = _market_fallback(
+                        groww, trading_symbol, transaction_type, remaining_qty, label, order_id
                     )
+                    if m_qty > 0:
+                        fills.append((m_qty, m_price or price, m_id))
+                        remaining_qty -= m_qty
+                    break
 
-                log.warning(
-                    f"{label}: order {order_id} not filled even at widest offset "
-                    f"(₹{offset}). LEAVING ORDER RESTING — fill unconfirmed. "
-                    "Manual check on Groww recommended."
-                )
-                return order_id, None
+                # For entry on last offset: cancel resting order to avoid stale fills later
+                try:
+                    _call(
+                        "orders", groww.cancel_order,
+                        groww_order_id=order_id, segment=groww.SEGMENT_FNO,
+                    )
+                    log.info(f"{label}: cancelled unfilled order {order_id} at widest offset (₹{offset}).")
+                    last_live_order_id = ""
+                except Exception as e:
+                    log.warning(f"{label}: failed to cancel unfilled order {order_id} at widest offset: {e}")
 
+                try:
+                    post_cancel = _call(
+                        "non_trading", groww.get_order_detail,
+                        groww_order_id=order_id, segment=groww.SEGMENT_FNO,
+                    )
+                    post_qty = int(round(_get_filled_quantity(post_cancel)))
+                    post_price = float(post_cancel.get("average_fill_price") or 0)
+                    if post_qty > 0:
+                        p_price = post_price or price
+                        fills.append((post_qty, p_price, order_id))
+                        remaining_qty -= post_qty
+                        log.warning(f"{label}: order {order_id} filled {post_qty} right at cancel time @ ₹{p_price:.2f}.")
+                except Exception:
+                    pass
+                break
+
+            # Not last offset: cancel resting order and proceed to next offset for remaining_qty
             try:
                 _call(
                     "orders", groww.cancel_order,
                     groww_order_id=order_id, segment=groww.SEGMENT_FNO,
                 )
                 log.info(f"{label}: order {order_id} not filled at offset=₹{offset} — cancelled, retrying wider.")
-                last_live_order_id = ""  # confirmed cancelled, no longer live
+                last_live_order_id = ""
             except Exception as e:
                 log.warning(
                     f"{label}: failed to cancel unfilled order {order_id} (offset=₹{offset}): {e}. "
-                    "Order state is now uncertain — halting escalation instead of placing another "
-                    "order on top of it. Treating as PENDING/UNCONFIRMED. "
+                    "Order state is uncertain — halting escalation to avoid duplicate orders. "
                     "VERIFY ACTUAL POSITION ON GROWW."
                 )
-                return order_id, None
+                break
 
-            # Re-check right after the cancel ack, in case the exchange
-            # filled the order in the brief window before/at cancellation.
+            # Re-check right after cancel ack in case order executed right at cancel time
             try:
                 post_cancel = _call(
                     "non_trading", groww.get_order_detail,
                     groww_order_id=order_id, segment=groww.SEGMENT_FNO,
                 )
-                if post_cancel.get("order_status") in FILLED_STATUSES:
-                    fill_price = float(post_cancel.get("average_fill_price") or 0)
-                    if fill_price:
-                        log.warning(
-                            f"{label}: order {order_id} actually FILLED right at cancel time "
-                            f"(avg_fill_price=₹{fill_price:.2f}) — using this fill instead of "
-                            "escalating to a new order."
-                        )
-                        return order_id, fill_price
-                post_cancel_qty = _get_filled_quantity(post_cancel)
+                post_cancel_qty = int(round(_get_filled_quantity(post_cancel)))
+                post_fill_price = float(post_cancel.get("average_fill_price") or 0)
                 if post_cancel_qty > 0:
+                    p_price = post_fill_price or price
+                    fills.append((post_cancel_qty, p_price, order_id))
+                    remaining_qty -= post_cancel_qty
                     log.warning(
-                        f"{label}: order {order_id} shows a PARTIAL fill ({post_cancel_qty}/{quantity}) "
-                        "right at cancel time. Halting escalation instead of placing a new order. "
-                        "VERIFY ACTUAL POSITION ON GROWW."
+                        f"{label}: order {order_id} actually filled {post_cancel_qty} right at cancel time @ ₹{p_price:.2f}. "
+                        f"Remaining quantity to fill: {remaining_qty}."
                     )
-                    return order_id, None
+                    if remaining_qty <= 0:
+                        break
             except Exception as e:
                 log.warning(f"{label}: post-cancel check failed for order {order_id}: {e}")
 
@@ -1712,35 +1787,58 @@ def _execute_with_escalation(
             if last_live_order_id:
                 log.error(
                     f"{label}: unexpected error while order {last_live_order_id} may still be "
-                    f"live (offset attempt {i + 1}/{len(ESCALATION_OFFSETS)}): {exc}. Returning "
-                    "this order as PENDING/UNCONFIRMED instead of retrying with a new order, to "
-                    "avoid duplicating a possibly-live position. VERIFY ACTUAL POSITION ON GROWW.",
+                    f"live (offset attempt {i + 1}/{len(ESCALATION_OFFSETS)}): {exc}. Halting "
+                    "escalation to avoid duplicate positions. VERIFY ACTUAL POSITION ON GROWW.",
                     exc_info=True,
                 )
-                return last_live_order_id, None
+                break
             log.error(
                 f"{label}: unexpected error with no order currently live "
-                f"(offset attempt {i + 1}/{len(ESCALATION_OFFSETS)}): {exc}. "
-                "Nothing to lose track of, so re-raising is safe.",
+                f"(offset attempt {i + 1}/{len(ESCALATION_OFFSETS)}): {exc}.",
                 exc_info=True,
             )
             raise
 
-    return last_live_order_id, None
+    # ── Aggregate fills across all attempts ───────────────────────────
+    total_filled = sum(q for q, p, o in fills)
+    if total_filled > 0:
+        valid_prices = [(q, p) for q, p, o in fills if p and p > 0]
+        avg_price = round(sum(q * p for q, p in valid_prices) / sum(q for q, p in valid_prices), 2) if valid_prices else None
+        primary_order_id = fills[0][2] if fills else last_order_id
+        if total_filled >= target_quantity:
+            price_str = f"₹{avg_price:.2f}" if avg_price else "unknown"
+            log.info(
+                f"{label}: FULLY FILLED across escalation attempts — "
+                f"qty={total_filled}/{target_quantity}  avg_fill_price={price_str}"
+            )
+        else:
+            price_str = f"₹{avg_price:.2f}" if avg_price else "unknown"
+            log.warning(
+                f"{label}: PARTIALLY FILLED across escalation attempts — "
+                f"qty={total_filled}/{target_quantity}  avg_fill_price={price_str}. "
+                "Remaining quantity will be topped up if conditions permit."
+            )
+        return primary_order_id, avg_price, total_filled
+
+    return last_order_id, None, 0
 
 
-def sell_option(groww: GrowwAPI, trading_symbol: str, quantity: int, label: str) -> tuple[str, float | None]:
-    """SELL to open, escalating the LIMIT price offset (₹2 → ₹5 → ₹10) until filled."""
+def sell_option(groww: GrowwAPI, trading_symbol: str, quantity: int, label: str) -> tuple[str, float | None, int]:
+    """SELL to open, escalating the LIMIT price offset (₹2 → ₹5 → ₹10 → ₹15) until filled.
+    If an order partially fills, a new order is immediately placed for the remaining quantity.
+    Returns (order_id, fill_price, executed_quantity)."""
     return _execute_with_escalation(
         groww, trading_symbol, groww.TRANSACTION_TYPE_SELL, quantity, "SELL", f"SELL {label}"
     )
 
 
-def buy_to_cover_option(groww: GrowwAPI, trading_symbol: str, quantity: int, label: str) -> tuple[str, float | None]:
+def buy_to_cover_option(groww: GrowwAPI, trading_symbol: str, quantity: int, label: str) -> tuple[str, float | None, int]:
     """
-    BUY to cover a short, escalating the LIMIT price offset (₹2 → ₹5 → ₹10)
-    until filled. If all three LIMIT offsets fail, a 4th retry cancels the
-    resting order and fires one MARKET order (see EXIT_MARKET_FALLBACK_ENABLED).
+    BUY to cover a short, escalating the LIMIT price offset (₹2 → ₹5 → ₹10 → ₹15)
+    until filled. If an order partially fills, a new order is immediately placed for the
+    remaining quantity. If all LIMIT offsets fail, a fallback cancels resting order and fires
+    a MARKET order (see EXIT_MARKET_FALLBACK_ENABLED).
+    Returns (order_id, fill_price, executed_quantity).
     """
     return _execute_with_escalation(
         groww, trading_symbol, groww.TRANSACTION_TYPE_BUY, quantity, "BUY", f"BUY (cover) {label}",
@@ -1779,17 +1877,18 @@ def switch_strike_on_profit(
     """
     symbol      = pos["symbol"]
     entry_price = pos.get("entry_price", 0.0)
-    quantity    = QUANTITY * pos["lot_size"]
+    quantity    = pos.get("quantity") or (QUANTITY * pos["lot_size"])
 
     log.info(
-        f"[PROFIT SWITCH] {leg_label}  symbol={symbol}  "
+        f"[PROFIT SWITCH] {leg_label}  symbol={symbol}  qty={quantity}  "
         f"entry=₹{entry_price:.2f}  profit >= {PROFIT_SWITCH_THRESHOLD} pts  "
         "→ Exiting current strike and re-entering new ATM strike."
     )
 
     # ── Step 1: Buy-to-cover current strike ─────────────────────────────────
-    cover_order_id, cover_fill = buy_to_cover_option(groww, symbol, quantity, leg_label)
+    cover_order_id, cover_fill, cover_qty = buy_to_cover_option(groww, symbol, quantity, leg_label)
     exit_time = datetime.now(IST)
+    actual_cover_qty = cover_qty if cover_qty > 0 else quantity
 
     if cover_fill is None and cover_order_id:
         # Cover fill is unconfirmed — keep leg open with exit_pending.
@@ -1797,7 +1896,7 @@ def switch_strike_on_profit(
         pnl_est = None
         try:
             exit_ltp = get_option_ltp(groww, symbol)
-            pnl_est  = (entry_price - exit_ltp) * quantity if entry_price else None
+            pnl_est  = (entry_price - exit_ltp) * actual_cover_qty if entry_price else None
         except Exception:
             pass
         log.warning(
@@ -1806,7 +1905,7 @@ def switch_strike_on_profit(
             "VERIFY ACTUAL POSITION ON GROWW."
         )
         log_trade(
-            leg=leg_label, action="EXIT", symbol=symbol, quantity=quantity,
+            leg=leg_label, action="EXIT", symbol=symbol, quantity=actual_cover_qty,
             price=None, fill_confirmed=False, order_id=cover_order_id,
             reason=f"Profit switch (>= {PROFIT_SWITCH_THRESHOLD} pts) — cover UNCONFIRMED",
             pnl=pnl_est, when=exit_time,
@@ -1814,7 +1913,7 @@ def switch_strike_on_profit(
         pos["exit_pending"]  = True
         pos["exit_order_id"] = cover_order_id
         pos["exit_reason"]   = f"profit switch >= {PROFIT_SWITCH_THRESHOLD} pts"
-        pos["exit_quantity"] = quantity
+        pos["exit_quantity"] = actual_cover_qty
         return pos
 
     if not cover_order_id:
@@ -1827,14 +1926,14 @@ def switch_strike_on_profit(
 
     # Cover confirmed
     cover_price = cover_fill  # confirmed fill
-    pnl = (entry_price - cover_price) * quantity if entry_price and cover_price else None
+    pnl = (entry_price - cover_price) * actual_cover_qty if entry_price and cover_price else None
     log.info(
-        f"[PROFIT SWITCH] {leg_label}: cover confirmed  symbol={symbol}  "
+        f"[PROFIT SWITCH] {leg_label}: cover confirmed  symbol={symbol}  qty={actual_cover_qty}  "
         f"entry=₹{entry_price:.2f}  cover=₹{cover_price:.2f}  "
         f"P&L=₹{pnl:.2f}  time={exit_time:%Y-%m-%d %H:%M:%S}"
     )
     log_trade(
-        leg=leg_label, action="EXIT", symbol=symbol, quantity=quantity,
+        leg=leg_label, action="EXIT", symbol=symbol, quantity=actual_cover_qty,
         price=cover_price, fill_confirmed=True, order_id=cover_order_id,
         reason=f"Profit switch (>= {PROFIT_SWITCH_THRESHOLD} pts)",
         pnl=pnl, when=exit_time,
@@ -1859,8 +1958,9 @@ def switch_strike_on_profit(
         return None
 
     new_qty = QUANTITY * new_lot
-    new_order_id, new_fill = sell_option(groww, new_sym, new_qty, leg_label)
+    new_order_id, new_fill, new_filled_qty = sell_option(groww, new_sym, new_qty, leg_label)
     re_entry_time = datetime.now(IST)
+    actual_re_entry_qty = new_filled_qty if new_filled_qty > 0 else new_qty
 
     if not new_order_id:
         log.error(
@@ -1877,6 +1977,7 @@ def switch_strike_on_profit(
     new_pos = {
         "symbol":      new_sym,
         "lot_size":    new_lot,
+        "quantity":    actual_re_entry_qty,
         "entry_price": new_fill,    # None if unconfirmed
         "entry_time":  re_entry_time,
         "order_id":    new_order_id,
@@ -1884,17 +1985,17 @@ def switch_strike_on_profit(
     if new_fill is not None:
         log.info(
             f"[PROFIT SWITCH] {leg_label}: re-entry confirmed  symbol={new_sym}  "
-            f"strike={new_atm}  fill=₹{new_fill:.2f}  qty={new_qty}  "
+            f"strike={new_atm}  fill=₹{new_fill:.2f}  qty={actual_re_entry_qty}  "
             f"time={re_entry_time:%Y-%m-%d %H:%M:%S}  order_id={new_order_id}"
         )
     else:
         log.warning(
             f"[PROFIT SWITCH] {leg_label}: re-entry order placed but fill UNCONFIRMED  "
-            f"symbol={new_sym}  qty={new_qty}  time={re_entry_time:%Y-%m-%d %H:%M:%S}  "
+            f"symbol={new_sym}  qty={actual_re_entry_qty}  time={re_entry_time:%Y-%m-%d %H:%M:%S}  "
             f"order_id={new_order_id}. VERIFY ACTUAL POSITION ON GROWW."
         )
     log_trade(
-        leg=leg_label, action="ENTRY", symbol=new_sym, quantity=new_qty,
+        leg=leg_label, action="ENTRY", symbol=new_sym, quantity=actual_re_entry_qty,
         price=new_fill if new_fill is not None else new_ltp_check,
         fill_confirmed=new_fill is not None, order_id=new_order_id,
         reason=f"Profit switch re-entry (>= {PROFIT_SWITCH_THRESHOLD} pts on prev strike)",
@@ -1904,14 +2005,10 @@ def switch_strike_on_profit(
 
 
 # ─── ORDER FILL PRICE POLLER ─────────────────────────────────────────────────
-def _await_fill_price(groww: GrowwAPI, order_id: str, retries: int = 6) -> float | None:
+def _await_fill_price(groww: GrowwAPI, order_id: str, retries: int = 6) -> tuple[float | None, int]:
     """
-    Poll order detail until the order is filled.
-    Returns average_fill_price, or None on timeout (caller falls back to LTP).
-
-    NOTE: get_order_status() does NOT return average_fill_price — only
-    get_order_detail() / get_order_list() do. Valid terminal "filled"
-    statuses per Groww docs are EXECUTED / COMPLETED / DELIVERY_AWAITED.
+    Poll order detail until the order is filled or partially filled.
+    Returns (average_fill_price, filled_quantity).
     """
     FILLED_STATUSES = ("EXECUTED", "COMPLETED", "DELIVERY_AWAITED")
     for _ in range(retries):
@@ -1921,17 +2018,18 @@ def _await_fill_price(groww: GrowwAPI, order_id: str, retries: int = 6) -> float
                 groww_order_id=order_id,
                 segment=groww.SEGMENT_FNO,
             )
-            if detail.get("order_status") in FILLED_STATUSES:
-                price = float(detail.get("average_fill_price") or 0)
-                if price:
-                    return price
+            filled_qty = int(round(_get_filled_quantity(detail)))
+            fill_price = float(detail.get("average_fill_price") or 0)
+            status     = detail.get("order_status")
+            if (status in FILLED_STATUSES or filled_qty > 0) and fill_price > 0:
+                return fill_price, filled_qty
         except Exception as e:
             log.warning(f"Error polling order {order_id}: {e}")
         time.sleep(0.5)
     log.warning(
         f"Order {order_id} not filled after {retries} polls — using LTP as fallback."
     )
-    return None
+    return None, 0
 
 
 # ─── MARKET STATUS ────────────────────────────────────────────────────────────
@@ -1963,7 +2061,7 @@ def square_off_position(
 ) -> dict:
     """
     Buy-to-cover a short option position.
-    pos dict: {"symbol": str, "entry_price": float, "order_id": str}
+    pos dict: {"symbol": str, "quantity": int, "entry_price": float, "order_id": str}
 
     Returns a trade record dict suitable for the trade journal:
       {"leg": leg_label, "symbol": ..., "quantity": ...,
@@ -1974,12 +2072,13 @@ def square_off_position(
     entry_price = pos.get("entry_price", 0.0)
     entry_time  = pos.get("entry_time")
     entry_str   = f"₹{entry_price:.2f}" if entry_price else "unknown"
-    log.warning(f"[{reason}] Covering short {leg_label}  entry={entry_str}  symbol={symbol}")
+    log.warning(f"[{reason}] Covering short {leg_label}  qty={quantity}  entry={entry_str}  symbol={symbol}")
 
-    order_id, fill_price = buy_to_cover_option(groww, symbol, quantity, leg_label)
+    order_id, fill_price, filled_qty = buy_to_cover_option(groww, symbol, quantity, leg_label)
     exit_time            = datetime.now(IST)
-    exit_fill_confirmed  = fill_price is not None
+    exit_fill_confirmed  = fill_price is not None and (filled_qty >= quantity or filled_qty == 0)
     exit_price           = fill_price if fill_price is not None else get_option_ltp(groww, symbol)
+    actual_exit_qty      = filled_qty if filled_qty > 0 else quantity
 
     hold_str = ""
     if entry_time is not None:
@@ -1987,16 +2086,16 @@ def square_off_position(
 
     if not exit_fill_confirmed:
         log.warning(
-            f"    {leg_label} cover order {order_id} fill UNCONFIRMED — "
+            f"    {leg_label} cover order {order_id} fill UNCONFIRMED (filled {filled_qty}/{quantity}) — "
             f"using LTP ₹{exit_price:.2f} for logging only. "
             "VERIFY ACTUAL POSITION ON GROWW."
         )
 
-    pnl = (entry_price - exit_price) * quantity if entry_price else None
+    pnl = (entry_price - exit_price) * actual_exit_qty if entry_price else None
 
     if entry_price:
         log.info(
-            f"[TRADE] {leg_label} EXIT  symbol={symbol}  qty={quantity}  "
+            f"[TRADE] {leg_label} EXIT  symbol={symbol}  qty={actual_exit_qty}  "
             f"entry=₹{entry_price:.2f}  exit=₹{exit_price:.2f}  "
             f"time={exit_time:%Y-%m-%d %H:%M:%S}{hold_str}  "
             f"P&L=₹{pnl:.2f}  fill_confirmed={exit_fill_confirmed}  "
@@ -2004,14 +2103,14 @@ def square_off_position(
         )
     else:
         log.info(
-            f"[TRADE] {leg_label} EXIT  symbol={symbol}  qty={quantity}  "
+            f"[TRADE] {leg_label} EXIT  symbol={symbol}  qty={actual_exit_qty}  "
             f"exit=₹{exit_price:.2f}  time={exit_time:%Y-%m-%d %H:%M:%S}{hold_str}  "
             f"P&L=N/A  fill_confirmed={exit_fill_confirmed}  "
             f"order_id={order_id}  reason={reason}"
         )
 
     log_trade(
-        leg=leg_label, action="EXIT", symbol=symbol, quantity=quantity,
+        leg=leg_label, action="EXIT", symbol=symbol, quantity=actual_exit_qty,
         price=exit_price, fill_confirmed=exit_fill_confirmed, order_id=order_id,
         reason=reason, pnl=pnl, when=exit_time,
     )
@@ -2019,7 +2118,7 @@ def square_off_position(
     return {
         "leg":                  leg_label,
         "symbol":               symbol,
-        "quantity":             quantity,
+        "quantity":             actual_exit_qty,
         "entry_price":          entry_price,
         "entry_time":           entry_time,
         "exit_price":           exit_price,
@@ -2066,10 +2165,20 @@ def attempt_square_off(
     if trade["exit_fill_confirmed"]:
         return None
 
+    # If a partial fill occurred during exit, reduce the open quantity accordingly
+    covered_qty = trade.get("quantity", 0)
+    current_qty = pos.get("quantity", quantity)
+    if 0 < covered_qty < current_qty:
+        pos["quantity"] = current_qty - covered_qty
+        log.warning(
+            f"{leg_label}: partial exit executed ({covered_qty} covered). "
+            f"Remaining open position quantity: {pos['quantity']}."
+        )
+
     pos["exit_pending"]  = True
     pos["exit_order_id"] = trade["exit_order_id"]
     pos["exit_reason"]   = reason
-    pos["exit_quantity"] = quantity
+    pos["exit_quantity"] = covered_qty
     log.warning(
         f"{leg_label}: cover order unconfirmed — leg kept OPEN (exit_pending=True) "
         f"instead of being cleared, so it isn't lost or duplicated. Will keep checking "
@@ -2166,15 +2275,16 @@ def run_strategy() -> None:
         if not leg_pos or leg_pos.get("entry_price") is None:
             return f"{leg_name}: FLAT"
         entry = leg_pos["entry_price"]
+        qty_str = f" (qty={leg_pos['quantity']})" if leg_pos.get("quantity") else ""
         try:
             live_ltp = get_option_ltp(groww_client, leg_pos["symbol"])
             diff     = live_ltp - entry   # positive = loss for the seller
             return (
-                f"{leg_name} SELL entry=₹{entry:.2f}  LTP=₹{live_ltp:.2f}  "
+                f"{leg_name} SELL{qty_str} entry=₹{entry:.2f}  LTP=₹{live_ltp:.2f}  "
                 f"diff={diff:+.2f}"
             )
         except Exception as e:
-            return f"{leg_name} SELL entry=₹{entry:.2f}  LTP=unavailable ({e})"
+            return f"{leg_name} SELL{qty_str} entry=₹{entry:.2f}  LTP=unavailable ({e})"
 
     while True:
         try:
@@ -2230,8 +2340,9 @@ def run_strategy() -> None:
                 had_positions = put_pos is not None or call_pos is not None
                 if put_pos is not None:
                     try:
+                        trade_qty = put_pos.get("quantity") or (QUANTITY * put_pos["lot_size"])
                         put_pos = attempt_square_off(
-                            groww, put_pos, QUANTITY * put_pos["lot_size"],
+                            groww, put_pos, trade_qty,
                             "PUT SELL", reason="SQUARE-OFF TIME"
                         )
                     except Exception as e:
@@ -2242,8 +2353,9 @@ def run_strategy() -> None:
                         )
                 if call_pos is not None:
                     try:
+                        trade_qty = call_pos.get("quantity") or (QUANTITY * call_pos["lot_size"])
                         call_pos = attempt_square_off(
-                            groww, call_pos, QUANTITY * call_pos["lot_size"],
+                            groww, call_pos, trade_qty,
                             "CALL SELL", reason="SQUARE-OFF TIME"
                         )
                     except Exception as e:
@@ -2341,12 +2453,15 @@ def run_strategy() -> None:
             for leg_pos, leg_name in [(put_pos, "PUT"), (call_pos, "CALL")]:
                 if leg_pos is not None and leg_pos.get("entry_price") is None:
                     try:
-                        confirmed = _await_fill_price(groww, leg_pos["order_id"])
-                        if confirmed is not None:
-                            leg_pos["entry_price"] = confirmed
+                        confirmed_price, confirmed_qty = _await_fill_price(groww, leg_pos["order_id"])
+                        if confirmed_price is not None:
+                            leg_pos["entry_price"] = confirmed_price
+                            if confirmed_qty > 0:
+                                leg_pos["quantity"] = confirmed_qty
                             log.info(
                                 f"[TRADE] {leg_name} ENTRY_RECOVERED  "
-                                f"symbol={leg_pos['symbol']}  fill=₹{confirmed:.2f}  "
+                                f"symbol={leg_pos['symbol']}  qty={leg_pos.get('quantity')}  "
+                                f"fill=₹{confirmed_price:.2f}  "
                                 f"order_id={leg_pos['order_id']}  reason=late fill confirmed"
                             )
                         else:
@@ -2373,12 +2488,12 @@ def run_strategy() -> None:
                 if leg_pos is None or not leg_pos.get("exit_pending"):
                     continue
                 try:
-                    confirmed = _await_fill_price(groww, leg_pos["exit_order_id"])
+                    confirmed_price, confirmed_qty = _await_fill_price(groww, leg_pos["exit_order_id"])
                 except Exception as e:
-                    confirmed = None
+                    confirmed_price, confirmed_qty = None, 0
                     log.warning(f"Could not resolve pending {leg_name} exit: {e}")
 
-                if confirmed is None:
+                if confirmed_price is None:
                     log.warning(
                         f"{leg_label}: exit order {leg_pos['exit_order_id']} still "
                         "unresolved — leg remains OPEN; not re-attempting a new cover "
@@ -2387,25 +2502,33 @@ def run_strategy() -> None:
                     continue
 
                 entry_price = leg_pos.get("entry_price")
-                exit_qty    = leg_pos.get("exit_quantity", QUANTITY * leg_pos["lot_size"])
-                pnl         = (entry_price - confirmed) * exit_qty if entry_price else None
+                exit_qty    = confirmed_qty if confirmed_qty > 0 else leg_pos.get("exit_quantity", leg_pos.get("quantity", QUANTITY * leg_pos["lot_size"]))
+                pnl         = (entry_price - confirmed_price) * exit_qty if entry_price else None
                 entry_str   = f"₹{entry_price:.2f}" if entry_price else "unknown"
                 pnl_str     = f"₹{pnl:.2f}" if pnl is not None else "N/A"
                 log.info(
                     f"[TRADE] {leg_label} EXIT CONFIRMED (was pending)  "
                     f"symbol={leg_pos['symbol']}  qty={exit_qty}  entry={entry_str}  "
-                    f"exit=₹{confirmed:.2f}  P&L={pnl_str}  "
+                    f"exit=₹{confirmed_price:.2f}  P&L={pnl_str}  "
                     f"order_id={leg_pos['exit_order_id']}  reason={leg_pos.get('exit_reason')}"
                 )
                 log_trade(
                     leg=leg_label, action="EXIT", symbol=leg_pos["symbol"], quantity=exit_qty,
-                    price=confirmed, fill_confirmed=True, order_id=leg_pos["exit_order_id"],
+                    price=confirmed_price, fill_confirmed=True, order_id=leg_pos["exit_order_id"],
                     reason=f"{leg_pos.get('exit_reason')} (confirmed on recheck)", pnl=pnl,
                 )
-                if leg_name == "PUT":
-                    put_pos = None
+                remaining_open = leg_pos.get("quantity", 0) - exit_qty
+                if remaining_open <= 0:
+                    if leg_name == "PUT":
+                        put_pos = None
+                    else:
+                        call_pos = None
                 else:
-                    call_pos = None
+                    leg_pos["quantity"] = remaining_open
+                    leg_pos["exit_pending"] = False
+                    log.warning(
+                        f"{leg_label}: exit confirmed {exit_qty} shares, but {remaining_open} still remain open."
+                    )
 
             # ═══════════════════════════════════════════════════════════════════
             #  PUT SELL LEG  (enter on BULLISH, exit on BEARISH + threshold)
@@ -2433,7 +2556,7 @@ def run_strategy() -> None:
                         groww, instruments_df, expiry, atm, "PE"
                     )
                     trade_qty  = QUANTITY * put_lot
-                    order_id, fill_price = sell_option(groww, put_sym, trade_qty, "PUT")
+                    order_id, fill_price, filled_qty = sell_option(groww, put_sym, trade_qty, "PUT")
                     entry_time = datetime.now(IST)
                     if not order_id:
                         # BUG FIX (found 27-Aug-2026): an empty order_id here
@@ -2462,30 +2585,81 @@ def run_strategy() -> None:
                             when=entry_time,
                         )
                     else:
+                        actual_qty = filled_qty if filled_qty > 0 else trade_qty
+                        is_partial = 0 < filled_qty < trade_qty
                         put_pos = {
                             "symbol":      put_sym,
                             "lot_size":    put_lot,
+                            "quantity":    actual_qty,
                             "entry_price": fill_price,   # None if fill unconfirmed
                             "entry_time":  entry_time,
                             "order_id":    order_id,
                         }
+                        partial_tag = " (PARTIAL)" if is_partial else ""
                         if fill_price is not None:
                             log.info(
-                                f"[TRADE] PUT SELL ENTRY  symbol={put_sym}  strike_ltp_check=₹{put_ltp_check:.2f}  "
-                                f"qty={trade_qty}  fill=₹{fill_price:.2f}  time={entry_time:%Y-%m-%d %H:%M:%S}  "
+                                f"[TRADE] PUT SELL ENTRY{partial_tag}  symbol={put_sym}  strike_ltp_check=₹{put_ltp_check:.2f}  "
+                                f"qty={actual_qty}  fill=₹{fill_price:.2f}  time={entry_time:%Y-%m-%d %H:%M:%S}  "
                                 f"order_id={order_id}  reason=ST flip BULLISH"
                             )
                         else:
                             log.warning(
-                                f"[TRADE] PUT SELL ENTRY (UNCONFIRMED)  symbol={put_sym}  qty={trade_qty}  "
+                                f"[TRADE] PUT SELL ENTRY (UNCONFIRMED)  symbol={put_sym}  qty={actual_qty}  "
                                 f"time={entry_time:%Y-%m-%d %H:%M:%S}  order_id={order_id}  reason=ST flip BULLISH  "
                                 "— fill price unknown. VERIFY ACTUAL POSITION ON GROWW."
                             )
                         log_trade(
-                            leg="PUT SELL", action="ENTRY", symbol=put_sym, quantity=trade_qty,
+                            leg="PUT SELL", action="ENTRY", symbol=put_sym, quantity=actual_qty,
                             price=fill_price if fill_price is not None else put_ltp_check,
                             fill_confirmed=fill_price is not None, order_id=order_id,
-                            reason="ST flip BULLISH", when=entry_time,
+                            reason=f"ST flip BULLISH{partial_tag}", when=entry_time,
+                        )
+
+            # ── Top-up partial quantity: PUT leg ──────────────────────────────
+            # If the open PUT short holds less than the target quantity (QUANTITY * lot_size),
+            # Supertrend is still BULLISH, entry window is open, and no exit is pending:
+            # immediately place a new order for the remaining quantity instead of trading partial.
+            if (
+                curr_direction == 1
+                and put_pos is not None
+                and not put_pos.get("exit_pending")
+                and entry_allowed
+            ):
+                target_put_qty = QUANTITY * put_pos.get("lot_size", 30)
+                current_put_qty = put_pos.get("quantity", 0)
+                if 0 < current_put_qty < target_put_qty:
+                    missing_put_qty = target_put_qty - current_put_qty
+                    log.warning(
+                        f"[TOP-UP] PUT SELL: currently holding partial quantity ({current_put_qty}/{target_put_qty}). "
+                        f"Placing top-up order for remaining quantity {missing_put_qty} x {put_pos['symbol']}..."
+                    )
+                    top_id, top_fill, top_filled_qty = sell_option(
+                        groww, put_pos["symbol"], missing_put_qty, "PUT TOP-UP"
+                    )
+                    if top_filled_qty > 0:
+                        old_qty   = current_put_qty
+                        old_price = put_pos.get("entry_price") or 0.0
+                        new_total = old_qty + top_filled_qty
+                        if top_fill and old_price:
+                            new_avg_entry = round((old_qty * old_price + top_filled_qty * top_fill) / new_total, 2)
+                        else:
+                            new_avg_entry = top_fill or old_price
+                        put_pos["quantity"]    = new_total
+                        put_pos["entry_price"] = new_avg_entry
+                        log.info(
+                            f"[TOP-UP SUCCESS] PUT SELL: top-up filled {top_filled_qty}/{missing_put_qty} @ ₹{top_fill:.2f}. "
+                            f"New total quantity={new_total}/{target_put_qty}, new weighted entry=₹{new_avg_entry:.2f}"
+                        )
+                        log_trade(
+                            leg="PUT SELL", action="TOP-UP", symbol=put_pos["symbol"],
+                            quantity=top_filled_qty, price=top_fill, fill_confirmed=top_fill is not None,
+                            order_id=top_id, reason=f"Top-up remaining quantity ({new_total}/{target_put_qty})",
+                            when=datetime.now(IST),
+                        )
+                    else:
+                        log.warning(
+                            f"[TOP-UP FAILED] PUT SELL: could not fill remaining {missing_put_qty} for {put_pos['symbol']}. "
+                            "Will retry next cycle if trend persists."
                         )
 
             # ── Profit-based strike switch: PUT leg ───────────────────────────
@@ -2539,7 +2713,7 @@ def run_strategy() -> None:
                             f"SIGNAL  ST BEARISH + |diff|={abs_diff:.2f} >= "
                             f"{EXIT_POINTS_THRESHOLD}  →  Covering PUT short"
                         )
-                        trade_qty = QUANTITY * put_pos["lot_size"]
+                        trade_qty = put_pos.get("quantity") or (QUANTITY * put_pos["lot_size"])
                         put_pos   = attempt_square_off(
                             groww, put_pos, trade_qty, "PUT SELL",
                             reason="ST flip BEARISH + threshold"
@@ -2574,7 +2748,7 @@ def run_strategy() -> None:
                         groww, instruments_df, expiry, atm, "CE"
                     )
                     trade_qty  = QUANTITY * call_lot
-                    order_id, fill_price = sell_option(groww, call_sym, trade_qty, "CALL")
+                    order_id, fill_price, filled_qty = sell_option(groww, call_sym, trade_qty, "CALL")
                     entry_time = datetime.now(IST)
                     if not order_id:
                         # See matching PUT SELL comment above: empty order_id
@@ -2594,30 +2768,81 @@ def run_strategy() -> None:
                             when=entry_time,
                         )
                     else:
+                        actual_qty = filled_qty if filled_qty > 0 else trade_qty
+                        is_partial = 0 < filled_qty < trade_qty
                         call_pos = {
                             "symbol":      call_sym,
                             "lot_size":    call_lot,
+                            "quantity":    actual_qty,
                             "entry_price": fill_price,   # None if fill unconfirmed
                             "entry_time":  entry_time,
                             "order_id":    order_id,
                         }
+                        partial_tag = " (PARTIAL)" if is_partial else ""
                         if fill_price is not None:
                             log.info(
-                                f"[TRADE] CALL SELL ENTRY  symbol={call_sym}  strike_ltp_check=₹{call_ltp_check:.2f}  "
-                                f"qty={trade_qty}  fill=₹{fill_price:.2f}  time={entry_time:%Y-%m-%d %H:%M:%S}  "
+                                f"[TRADE] CALL SELL ENTRY{partial_tag}  symbol={call_sym}  strike_ltp_check=₹{call_ltp_check:.2f}  "
+                                f"qty={actual_qty}  fill=₹{fill_price:.2f}  time={entry_time:%Y-%m-%d %H:%M:%S}  "
                                 f"order_id={order_id}  reason=ST flip BEARISH"
                             )
                         else:
                             log.warning(
-                                f"[TRADE] CALL SELL ENTRY (UNCONFIRMED)  symbol={call_sym}  qty={trade_qty}  "
+                                f"[TRADE] CALL SELL ENTRY (UNCONFIRMED)  symbol={call_sym}  qty={actual_qty}  "
                                 f"time={entry_time:%Y-%m-%d %H:%M:%S}  order_id={order_id}  reason=ST flip BEARISH  "
                                 "— fill price unknown. VERIFY ACTUAL POSITION ON GROWW."
                             )
                         log_trade(
-                            leg="CALL SELL", action="ENTRY", symbol=call_sym, quantity=trade_qty,
+                            leg="CALL SELL", action="ENTRY", symbol=call_sym, quantity=actual_qty,
                             price=fill_price if fill_price is not None else call_ltp_check,
                             fill_confirmed=fill_price is not None, order_id=order_id,
-                            reason="ST flip BEARISH", when=entry_time,
+                            reason=f"ST flip BEARISH{partial_tag}", when=entry_time,
+                        )
+
+            # ── Top-up partial quantity: CALL leg ─────────────────────────────
+            # If the open CALL short holds less than the target quantity (QUANTITY * lot_size),
+            # Supertrend is still BEARISH, entry window is open, and no exit is pending:
+            # immediately place a new order for the remaining quantity instead of trading partial.
+            if (
+                curr_direction == -1
+                and call_pos is not None
+                and not call_pos.get("exit_pending")
+                and entry_allowed
+            ):
+                target_call_qty = QUANTITY * call_pos.get("lot_size", 30)
+                current_call_qty = call_pos.get("quantity", 0)
+                if 0 < current_call_qty < target_call_qty:
+                    missing_call_qty = target_call_qty - current_call_qty
+                    log.warning(
+                        f"[TOP-UP] CALL SELL: currently holding partial quantity ({current_call_qty}/{target_call_qty}). "
+                        f"Placing top-up order for remaining quantity {missing_call_qty} x {call_pos['symbol']}..."
+                    )
+                    top_id, top_fill, top_filled_qty = sell_option(
+                        groww, call_pos["symbol"], missing_call_qty, "CALL TOP-UP"
+                    )
+                    if top_filled_qty > 0:
+                        old_qty   = current_call_qty
+                        old_price = call_pos.get("entry_price") or 0.0
+                        new_total = old_qty + top_filled_qty
+                        if top_fill and old_price:
+                            new_avg_entry = round((old_qty * old_price + top_filled_qty * top_fill) / new_total, 2)
+                        else:
+                            new_avg_entry = top_fill or old_price
+                        call_pos["quantity"]    = new_total
+                        call_pos["entry_price"] = new_avg_entry
+                        log.info(
+                            f"[TOP-UP SUCCESS] CALL SELL: top-up filled {top_filled_qty}/{missing_call_qty} @ ₹{top_fill:.2f}. "
+                            f"New total quantity={new_total}/{target_call_qty}, new weighted entry=₹{new_avg_entry:.2f}"
+                        )
+                        log_trade(
+                            leg="CALL SELL", action="TOP-UP", symbol=call_pos["symbol"],
+                            quantity=top_filled_qty, price=top_fill, fill_confirmed=top_fill is not None,
+                            order_id=top_id, reason=f"Top-up remaining quantity ({new_total}/{target_call_qty})",
+                            when=datetime.now(IST),
+                        )
+                    else:
+                        log.warning(
+                            f"[TOP-UP FAILED] CALL SELL: could not fill remaining {missing_call_qty} for {call_pos['symbol']}. "
+                            "Will retry next cycle if trend persists."
                         )
 
             # ── Profit-based strike switch: CALL leg ──────────────────────────
@@ -2666,7 +2891,7 @@ def run_strategy() -> None:
                             f"SIGNAL  ST BULLISH + |diff|={abs_diff:.2f} >= "
                             f"{EXIT_POINTS_THRESHOLD}  →  Covering CALL short"
                         )
-                        trade_qty = QUANTITY * call_pos["lot_size"]
+                        trade_qty = call_pos.get("quantity") or (QUANTITY * call_pos["lot_size"])
                         call_pos  = attempt_square_off(
                             groww, call_pos, trade_qty, "CALL SELL",
                             reason="ST flip BULLISH + threshold"
@@ -2686,8 +2911,9 @@ def run_strategy() -> None:
             log.info("KeyboardInterrupt — squaring off all open positions…")
             if put_pos is not None:
                 try:
+                    trade_qty = put_pos.get("quantity") or (QUANTITY * put_pos["lot_size"])
                     put_pos = attempt_square_off(
-                        groww, put_pos, QUANTITY * put_pos["lot_size"],
+                        groww, put_pos, trade_qty,
                         "PUT SELL", reason="KeyboardInterrupt"
                     )
                 except Exception as e:
@@ -2698,8 +2924,9 @@ def run_strategy() -> None:
                     )
             if call_pos is not None:
                 try:
+                    trade_qty = call_pos.get("quantity") or (QUANTITY * call_pos["lot_size"])
                     call_pos = attempt_square_off(
-                        groww, call_pos, QUANTITY * call_pos["lot_size"],
+                        groww, call_pos, trade_qty,
                         "CALL SELL", reason="KeyboardInterrupt"
                     )
                 except Exception as e:
