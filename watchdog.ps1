@@ -1,4 +1,4 @@
-$service = "GTAlgo"
+$service = "GTAlgoSellSupertrend"
 
 try {
     $svc = Get-Service -Name $service -ErrorAction Stop
